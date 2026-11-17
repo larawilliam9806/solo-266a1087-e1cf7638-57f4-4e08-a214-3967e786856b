@@ -65,6 +65,32 @@
   </div>
 
   <div class="card">
+    <h2>④ 首页响应乱序演示（延迟仅作用于无令牌取首页）</h2>
+    <div class="row">
+      <label for="homeDelay" style="color:#94a3b8">延迟秒数</label>
+      <input id="homeDelay" type="number" min="0" max="60" step="1" value="4"
+             style="width:90px;font:inherit;padding:7px 10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#f1f5f9" />
+      <button onclick="openSlowCatalog()">打开带延迟的目录地址</button>
+    </div>
+    <p style="color:#94a3b8;font-size:12px;margin:10px 0 0">
+      打开后把该地址作为“目录接口地址”在采集台建批：首页会晚返回，但采集端
+      已在请求到达时确定启动序。下方“首页请求到达顺序”按请求到达先后列出，
+      可对照采集台表格中“启动序 / 落库 #”验证乱序。注意：在浏览器新标签页
+      打开只会发出一次首页请求，不影响采集端。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>首页请求到达顺序（每 3 秒刷新）</h2>
+    <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+      <thead><tr><th style="text-align:left;color:#94a3b8;padding:6px">到达序号</th>
+        <th style="text-align:left;color:#94a3b8;padding:6px">延迟(秒)</th>
+        <th style="text-align:left;color:#94a3b8;padding:6px">到达时间</th></tr></thead>
+      <tbody id="arrivalRows"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
     <h2>源当前状态（每 3 秒刷新）</h2>
     <div class="kv" id="stateKv"></div>
     <pre id="stateJson"></pre>
@@ -99,6 +125,22 @@ async function invalidate() {
     flash("当前令牌已失效，采集端需新建批次", true); await refresh(); }
   catch (e) { flash("失败：" + e.message, false); }
 }
+function openSlowCatalog() {
+  const d = Math.max(0, Math.min(60, Number($("homeDelay").value) || 0));
+  const url = new URL("/catalog", window.location.origin);
+  if (d > 0) url.searchParams.set("home_delay", String(d));
+  window.open(url.toString(), "_blank", "noopener");
+  flash("已打开：" + url, true);
+}
+function renderArrivals(s) {
+  const rows = (s.home_arrivals || []).map(a =>
+    `<tr><td style="padding:6px;border-top:1px solid #334155">#${a.seq}</td>
+      <td style="padding:6px;border-top:1px solid #334155">${a.delay}</td>
+      <td style="padding:6px;border-top:1px solid #334155">${a.arrived_at}</td></tr>`
+  ).join("");
+  $("arrivalRows").innerHTML = rows ||
+    `<tr><td colspan="3" style="padding:6px;color:#64748b">尚无无令牌首页请求</td></tr>`;
+}
 async function refresh() {
   const s = await api("/admin/state");
   $("version").innerHTML = s.versions.map(v => `<option ${v === s.version ? "selected" : ""}>${v}</option>`).join("");
@@ -111,6 +153,7 @@ async function refresh() {
     <b>总页数</b><div>${s.total_pages}</div>
     <b>待触发故障</b><div>${s.fail_once.length ? JSON.stringify(s.fail_once) : "无"}</div>
     <b>已失效令牌</b><div>${s.dead_tokens.map(t => `<code>${t}</code>`).join(" ") || "无"}</div>`;
+  renderArrivals(s);
   $("stateJson").textContent = JSON.stringify(s, null, 2);
 }
 refresh(); setInterval(refresh, 3000);

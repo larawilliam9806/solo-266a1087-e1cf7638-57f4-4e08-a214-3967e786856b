@@ -20,6 +20,7 @@ import uvicorn
 from app_service.config import Settings
 from app_service.main import create_app
 from source_service.app import app as source_app
+from source_service.app import state as source_state
 
 
 def _free_port() -> int:
@@ -80,6 +81,8 @@ class Harness:
         self.source = Server(source_app, "source")
 
     def __enter__(self) -> "Harness":
+        # 源状态是进程内单例：每个用例从干净的 v1 开始，互不影响
+        source_state.reset()
         self.source.start()
         self.client = httpx.Client(base_url=self.source.base_url, timeout=10)
         return self
@@ -394,3 +397,225 @@ def test_no_published_data_returns_404_and_bad_url_rejected(harness):
             assert c.get("/").status_code == 200
     finally:
         srv.stop()
+
+
+# ---------------------------------------------------------------------------
+# 并发发布缺陷回归：启动顺序以服务端收到启动请求为准，不由首页返回先后决定
+# ---------------------------------------------------------------------------
+
+def _wait_home_requests(harness, count: int, timeout: float = 10) -> dict:
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        last = harness.client.get("/admin/state").json()
+        if last["home_requests"] >= count:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"源未在超时内收到 {count} 次首页请求，最后状态: {last}")
+
+
+def _create_batch_async(base_url: str, source_url: str, timeout: float = 30):
+    """在独立线程里建批并返回结果容器（用于让慢首页建批请求先到达）。"""
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            with httpx.Client(base_url=base_url, timeout=timeout) as c:
+                r = c.post("/api/batches", json={"source_url": source_url})
+                box["status"] = r.status_code
+                box["body"] = r.json()
+        except Exception as exc:  # pragma: no cover - 便于失败时定位
+            box["error"] = exc
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    box["thread"] = t
+    return box
+
+
+def test_slow_home_earlier_batch_cannot_overwrite_later(harness):
+    """乱序首页：先启动的慢首页批次后返回、后采齐，不得覆盖较晚批次已发布数据。
+
+    旧实现以“首页返回后才插入的自增 id”判定新旧，慢首页的早批次会拿到
+    更大的 id，从而被误判为“更晚启动”并覆盖新批次。这里同时断言该 id
+    逆序确实发生，确保测试真正覆盖缺陷而不是碰巧按序完成。
+    """
+    srv = harness.start_app()
+    try:
+        slow_url = f"{harness.source.base_url}/catalog?home_delay=3"
+        fast_url = f"{harness.source.base_url}/catalog"
+
+        # 先发出“慢首页”建批请求；等源确认已收到该首页请求（服务端已处理、
+        # 已分配启动序），再发出“快首页”建批请求。
+        early = _create_batch_async(srv.base_url, slow_url)
+        _wait_home_requests(harness, 1)
+
+        with httpx.Client(base_url=srv.base_url, timeout=20) as c:
+            late = c.post("/api/batches", json={"source_url": fast_url}).json()
+
+            # 较晚批次在早批次仍等待首页时就已独立开跑并发布 → 慢首页不阻塞
+            assert c.get(f"/api/batches/{late['id']}").json()["status"] in (
+                "running", "published")
+            published = _wait_status(c, late["id"], {"published"}, timeout=15)
+
+            early["thread"].join(timeout=30)
+            assert "error" not in early, early.get("error")
+            assert early["status"] == 201, early.get("body")
+            early_batch = early["body"]
+
+            # 缺陷前提成立：早启动的批次因首页慢，落库 id 反而更大
+            assert early_batch["start_seq"] < late["start_seq"]
+            assert early_batch["id"] > late["id"]
+
+            # 早启动批次即使采齐也只能被取代，不能覆盖较晚批次
+            done = _wait_status(c, early_batch["id"], {"superseded"}, timeout=20)
+            assert done["saved_pages"] == [1, 2, 3]
+
+            pub = c.get("/api/published").json()
+            assert pub["snapshot"]["batch_id"] == late["id"]
+            assert pub["snapshot"]["snapshot_token"] == late["snapshot_token"]
+            assert len(pub["items"]) == 6
+    finally:
+        srv.stop()
+
+
+def test_earlier_batch_publishes_when_later_batch_failed(harness):
+    """较晚批次未成功发布（失败）时，不得阻止较早批次正常发布。"""
+    # 让较晚批次在第 3 页失败一次；较早批次的慢首页晚于它返回
+    assert harness.client.post("/admin/fail-page-once",
+                               params={"version": "v1", "page": 3}).status_code == 200
+    srv = harness.start_app()
+    try:
+        slow_url = f"{harness.source.base_url}/catalog?home_delay=2"
+        fast_url = f"{harness.source.base_url}/catalog"
+
+        early = _create_batch_async(srv.base_url, slow_url)
+        _wait_home_requests(harness, 1)
+
+        with httpx.Client(base_url=srv.base_url, timeout=20) as c:
+            # 较晚批次先拿到首页，但第 3 页一次性失败 → failed，未发布
+            late = c.post("/api/batches", json={"source_url": fast_url}).json()
+            late_failed = _wait_status(c, late["id"], {"failed"}, timeout=15)
+            assert late_failed["error_code"] == "http_500"
+            assert c.get("/api/published").status_code == 404  # 尚未有发布
+
+            early["thread"].join(timeout=30)
+            assert early["status"] == 201, early.get("body")
+            early_batch = early["body"]
+            assert early_batch["start_seq"] < late["start_seq"]
+
+            # 早批次正常发布（较晚批次失败不构成保护）
+            done = _wait_status(c, early_batch["id"], {"published"}, timeout=20)
+            assert done["saved_pages"] == [1, 2, 3]
+            pub = c.get("/api/published").json()
+            assert pub["snapshot"]["batch_id"] == early_batch["id"]
+
+            # 稍后把较晚批次续采成功 → 它启动更晚，允许覆盖
+            assert c.post(f"/api/batches/{late['id']}/resume").status_code == 200
+            _wait_status(c, late["id"], {"published"}, timeout=20)
+            assert c.get("/api/published").json()["snapshot"]["batch_id"] == late["id"]
+    finally:
+        srv.stop()
+
+
+def test_restart_recovered_earlier_batch_cannot_overwrite_later(harness):
+    """重启恢复的较早批次：续采发布时仍不得覆盖较晚批次。"""
+    # 早批次在第 3 页失败（真实失败现场），稍后模拟“发布前进程被杀”
+    assert harness.client.post("/admin/fail-page-once",
+                               params={"version": "v1", "page": 3}).status_code == 200
+    srv1 = harness.start_app()
+    try:
+        with httpx.Client(base_url=srv1.base_url, timeout=20) as c:
+            b_early = c.post("/api/batches",
+                             json={"source_url": f"{harness.source.base_url}/catalog"}).json()
+            _wait_status(c, b_early["id"], {"failed"}, timeout=15)
+
+            # 较晚批次完整发布
+            b_late = c.post("/api/batches",
+                            json={"source_url": f"{harness.source.base_url}/catalog"}).json()
+            _wait_status(c, b_late["id"], {"published"}, timeout=15)
+            assert b_early["start_seq"] < b_late["start_seq"]
+
+            db = harness.open_db()
+            try:
+                # 模拟发布前进程被杀：磁盘上仍为 running，线程已不存在
+                db.mark_batch(b_early["id"], "running")
+            finally:
+                db.close()
+    finally:
+        srv1.stop()
+
+    srv2 = harness.start_app()
+    try:
+        with httpx.Client(base_url=srv2.base_url, timeout=20) as c:
+            health = c.get("/health").json()
+            assert b_early["id"] in health["recovered_batches"]
+            assert c.get(f"/api/batches/{b_early['id']}").json()["status"] == "failed"
+
+            assert c.post(f"/api/batches/{b_early['id']}/resume").status_code == 200
+            done = _wait_status(c, b_early["id"], {"superseded"}, timeout=20)
+            assert done["saved_pages"] == [1, 2, 3]
+            assert c.get("/api/published").json()["snapshot"]["batch_id"] == b_late["id"]
+    finally:
+        srv2.stop()
+
+
+def test_legacy_database_without_start_seq_is_migrated(harness, tmp_path):
+    """旧库兼容：无 start_seq 列的既有库可打开、回填，并按旧语义防覆盖。"""
+    import sqlite3
+    legacy_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(legacy_path)
+    try:
+        # 与旧版本完全一致的表结构（batches 无 start_seq）
+        conn.executescript("""
+        CREATE TABLE batches (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_url      TEXT NOT NULL,
+            snapshot_token  TEXT NOT NULL,
+            source_version  TEXT,
+            total_pages     INTEGER,
+            status          TEXT NOT NULL,
+            error_code      TEXT,
+            error_message   TEXT,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT
+        );
+        CREATE TABLE batch_pages (
+            batch_id INTEGER NOT NULL, page_no INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY (batch_id, page_no)
+        );
+        CREATE TABLE items (
+            item_id TEXT PRIMARY KEY, name TEXT NOT NULL, era TEXT,
+            material TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE published_items (
+            item_id TEXT PRIMARY KEY, name TEXT NOT NULL, era TEXT, material TEXT
+        );
+        CREATE TABLE published_snapshot (
+            id INTEGER PRIMARY KEY CHECK (id = 1), batch_id INTEGER NOT NULL,
+            snapshot_token TEXT NOT NULL, source_version TEXT,
+            published_at TEXT NOT NULL, item_count INTEGER NOT NULL
+        );
+        INSERT INTO batches (id, source_url, snapshot_token, total_pages, status, started_at)
+        VALUES (7, 'http://legacy/catalog', 'snap-v1-legacy', 3, 'published', '2020-01-01T00:00:00+00:00');
+        INSERT INTO published_snapshot (id, batch_id, snapshot_token, source_version,
+                                         published_at, item_count)
+        VALUES (1, 7, 'snap-v1-legacy', 'v1', '2020-01-01T00:00:00+00:00', 0);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    from app_service.db import Database
+
+    db = Database(legacy_path)
+    try:
+        batch = db.get_batch(7)
+        assert batch["start_seq"] == 7  # 旧库按 id 回填，语义延续
+        assert db.get_published()["snapshot"]["start_seq"] == 7
+        # 新建批次的启动序接在历史数据之后
+        assert db.allocate_start_seq() > 7
+    finally:
+        db.close()
+

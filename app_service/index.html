@@ -62,11 +62,16 @@
       <input id="sourceUrl" type="text" placeholder="http://source:8001/catalog" />
       <div class="row">
         <button onclick="createBatch()">启动新批次</button>
+        <button class="ghost" onclick="createBatch(4)">启动慢首页批次（4 秒）</button>
+        <button class="ghost" onclick="demoOutOfOrder()">一键乱序演示</button>
         <button class="ghost" onclick="refresh()">刷新状态</button>
       </div>
       <div id="msg"></div>
       <p class="muted" style="margin-top:14px">
         令牌失效（410）的批次无法续采，需新建批次；新旧快照不会混用。
+        “慢首页批次”让源延迟返回首页；“一键乱序演示”会先启动慢首页批次、
+        再启动快首页批次，验证先启动的请求后返回、后采齐时也不会覆盖较晚
+        批次已完整发布的数据（表格中可见其落库 # 更大但启动序更小）。
       </p>
     </section>
 
@@ -88,11 +93,11 @@
       <table>
         <thead>
           <tr>
-            <th>#</th><th>状态</th><th>源版本</th><th>快照令牌</th>
+            <th>#</th><th>启动序</th><th>状态</th><th>源版本</th><th>快照令牌</th>
             <th>页进度</th><th>已保存页</th><th>启动 / 完成</th><th>操作 / 错误</th>
           </tr>
         </thead>
-        <tbody id="batchRows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+        <tbody id="batchRows"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
       </table>
     </section>
 
@@ -126,17 +131,49 @@ async function api(path, opts) {
   }
   return data;
 }
-async function createBatch() {
-  const url = $("sourceUrl").value.trim();
-  if (!url) return flash("请填写目录接口地址", false);
+async function createBatch(delaySec = 0, quiet = false) {
+  const raw = $("sourceUrl").value.trim();
+  if (!raw) { flash("请填写目录接口地址", false); return null; }
+  let url = raw;
+  if (delaySec > 0) {
+    try {
+      const u = new URL(raw);
+      u.searchParams.set("home_delay", String(delaySec));
+      url = u.toString();
+    } catch (e) {
+      url = raw + (raw.includes("?") ? "&" : "?") + "home_delay=" + delaySec;
+    }
+  }
   try {
     const b = await api("/api/batches", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({source_url: url})
     });
-    flash(`批次 #${b.id} 已创建并开始采集（快照 ${b.snapshot_token}）`, true);
+    if (!quiet) {
+      flash(`批次 #${b.id} 已创建并开始采集（启动序 ${b.start_seq}，快照 ${b.snapshot_token}）`, true);
+    }
     await refresh();
-  } catch (e) { flash("创建失败：" + e.message, false); }
+    return b;
+  } catch (e) {
+    if (!quiet) flash("创建失败：" + e.message, false);
+    throw e;
+  }
+}
+async function demoOutOfOrder() {
+  // 先发出慢首页建批请求（不等待返回），稍后再发出快首页批次。
+  // 首页响应乱序，但服务端以请求到达时刻分配启动序，防覆盖不受影响。
+  flash("乱序演示：已先启动慢首页批次，正在启动快首页批次…", true);
+  const slowPromise = createBatch(4, true);
+  await new Promise(r => setTimeout(r, 700));
+  try {
+    const fast = await createBatch(0, true);
+    const slow = await slowPromise;
+    flash(`演示已就绪：慢首页批次 #${slow.id}（启动序 ${slow.start_seq}，落库更晚）` +
+          ` 与 快首页批次 #${fast.id}（启动序 ${fast.start_seq}）。` +
+          `快批次发布后，慢批次将显示“被更新批次取代”。`, true);
+  } catch (e) {
+    flash("乱序演示失败：" + e.message, false);
+  }
 }
 async function resume(id) {
   try {
@@ -158,6 +195,7 @@ function renderBatches(data) {
     const err = b.error_message ? `<div class="err-text">${b.error_message}</div>` : "";
     return `<tr>
       <td>#${b.id}</td>
+      <td>${b.start_seq ?? "—"}</td>
       <td><span class="badge s-${b.status}">${STATUS_LABEL[b.status] || b.status}</span></td>
       <td>${b.source_version ?? "—"}</td>
       <td><code>${b.snapshot_token}</code></td>
@@ -168,7 +206,7 @@ function renderBatches(data) {
       <td>${action}${err}</td>
     </tr>`;
   }).join("");
-  $("batchRows").innerHTML = rows || `<tr><td colspan="8" class="muted">尚无批次</td></tr>`;
+  $("batchRows").innerHTML = rows || `<tr><td colspan="9" class="muted">尚无批次</td></tr>`;
 }
 
 async function refresh() {
@@ -193,7 +231,7 @@ async function refresh() {
       $("itemRows").innerHTML = `<tr><td colspan="4" class="muted">尚无已发布数据</td></tr>`;
     }
   } catch (e) {
-    $("batchRows").innerHTML = `<tr><td colspan="8" class="err-text">刷新失败：${e.message}</td></tr>`;
+    $("batchRows").innerHTML = `<tr><td colspan="9" class="err-text">刷新失败：${e.message}</td></tr>`;
   }
 }
 

@@ -133,7 +133,9 @@ class Collector:
         # 批次自始至终只使用建批时保存的快照令牌，不接受外部替换
         params["token"] = token
         try:
-            resp = client.get(batch["source_url"], params=params)
+            # 合并而非替换源地址原有查询参数，保留目录接口上的其它参数
+            url = httpx.URL(batch["source_url"]).copy_merge_params(params)
+            resp = client.get(url)
         except httpx.HTTPError as exc:
             self.db.mark_batch(
                 batch_id, "failed",

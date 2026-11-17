@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -66,6 +66,18 @@ def create_app(settings: Settings | None = None,
     app.state.settings = cfg
     app.state.recovered_on_startup = recovered
 
+    @app.middleware("http")
+    async def stamp_start_seq(request: Request, call_next):
+        """建批请求一到达服务端就分配启动序，先于任何请求体解析与网络 IO。
+
+        这是"启动顺序"的唯一权威来源：首页响应返回的先后只影响批次何时
+        落库/开跑，绝不参与顺序判定。分配在事件循环中同步完成（仅一条
+        SQLite 计数更新），保证并发请求按到达顺序取得递增且唯一的序号。
+        """
+        if request.method == "POST" and request.url.path.rstrip("/") == "/api/batches":
+            request.state.start_seq = database.allocate_start_seq()
+        return await call_next(request)
+
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok", "recovered_batches": recovered}
@@ -80,13 +92,21 @@ def create_app(settings: Settings | None = None,
     # ---------------- 批次 ----------------
 
     @app.post("/api/batches", status_code=201)
-    def create_batch(body: CreateBatchBody) -> dict:
+    def create_batch(body: CreateBatchBody, request: Request) -> dict:
+        # 启动序由中间件在请求到达时分配（见 stamp_start_seq），这里只读取；
+        # 首页响应快慢、落库先后都不改变它。同步端点运行在线程池中，慢首页
+        # 不会阻塞其它批次（其它建批请求与采集线程照常运行）。
+        start_seq = getattr(request.state, "start_seq", None)
+        if start_seq is None:  # 防御：中间件未命中时仍不退回 id 顺序
+            start_seq = database.allocate_start_seq()
         url = _validate_url(body.source_url)
 
         # 建批前先探测首页：拿到快照令牌、版本与总页数，确保批次绑定确定快照
         try:
             with httpx.Client(timeout=cfg.request_timeout) as client:
-                resp = client.get(url, params={"page": 1})
+                # 合并而非替换 URL 上已有的查询参数：目录地址可自带参数
+                # （如示例源的 home_delay），httpx 的 params= 会整体替换查询串。
+                resp = client.get(httpx.URL(url).copy_merge_params({"page": 1}))
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=502,
@@ -118,6 +138,7 @@ def create_app(settings: Settings | None = None,
             snapshot_token=str(token),
             source_version=first_page.get("version"),
             total_pages=total_pages,
+            start_seq=start_seq,
         )
         # 首页已成功取得，直接落库；采集线程从第 2 页开始，绝不重复请求第 1 页
         database.save_page(batch_id, 1, first_page)

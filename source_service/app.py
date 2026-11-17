@@ -15,12 +15,20 @@ POST /admin/switch-version        切换版本，旧版本全部令牌失效
 POST /admin/fail-page-once        令某版本的某一页下一次请求失败（500，仅一次）
 POST /admin/invalidate-token      立即令所有存活令牌失效
 GET  /admin/state                 查询源当前状态
+
+首页慢响应演示
+--------------
+GET /catalog?home_delay=<秒>      仅让“无令牌取首页”的响应延迟（0~60 秒）。
+延迟在锁外 sleep，多个请求互不阻塞；翻页请求不受影响。配合两个不同
+home_delay 的目录地址，可稳定复现“先启动的请求后返回首页”的乱序场景。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Query
@@ -44,13 +52,46 @@ class SourceState:
         self.dead_tokens: set[str] = set()
         # 一次性故障：{(version, page_no): count}，>0 时下一次访问该页报错
         self.fail_once: dict[tuple[str, int], int] = {}
+        # 首页请求到达记录（含被 home_delay 延迟的请求），供演示/自测确认
+        # “先到的启动请求可能后拿到首页”
+        self._home_requests = 0
+        self.home_arrivals: list[dict] = []
         self._mint_locked()
+
+    def note_home_arrival(self, delay: float) -> int:
+        """记录一次无令牌首页请求的到达（在 sleep 之前调用）。"""
+        with self._lock:
+            self._home_requests += 1
+            seq = self._home_requests
+            now = time.time()
+            self.home_arrivals.append({
+                "seq": seq,
+                "delay": delay,
+                "arrived_at": datetime.fromtimestamp(now, timezone.utc).isoformat(
+                    timespec="milliseconds"),
+            })
+            # 只保留最近 50 条，避免内存无限增长
+            if len(self.home_arrivals) > 50:
+                del self.home_arrivals[:-50]
+            return seq
 
     def _mint_locked(self) -> str:
         token = f"snap-{self.version}-{uuid.uuid4().hex[:12]}"
         self.live_tokens[token] = self.version
         self.current_token = token
         return token
+
+    def reset(self) -> None:
+        """把源恢复到初始状态（v1、仅一个新令牌、无故障）。供演示/自测隔离。"""
+        with self._lock:
+            self.version = ALL_VERSIONS[0]
+            self.live_tokens.clear()
+            self.dead_tokens.clear()
+            self.fail_once.clear()
+            self.current_token = None
+            self._home_requests = 0
+            self.home_arrivals = []
+            self._mint_locked()
 
     def _kill_all_live_locked(self) -> None:
         self.dead_tokens.update(self.live_tokens)
@@ -69,6 +110,8 @@ class SourceState:
                 ],
                 "versions": ALL_VERSIONS,
                 "total_pages": len(paginate(self.version)),
+                "home_requests": self._home_requests,
+                "home_arrivals": list(self.home_arrivals),
             }
 
     def switch_version(self, version: str) -> dict:
@@ -186,7 +229,17 @@ def health() -> dict:
 def catalog(
     token: str | None = Query(default=None, description="快照令牌"),
     page: int = Query(default=1, ge=1, description="页码，从 1 开始"),
+    home_delay: float = Query(
+        default=0, ge=0, le=60,
+        description="仅对无令牌首页响应生效的模拟延迟（秒），用于演示响应乱序",
+    ),
 ) -> JSONResponse:
+    # 延迟必须在状态锁之外：其他并发请求（含较晚批次）不被慢首页阻塞。
+    # 只影响“无令牌取首页”的探测请求，翻页采集仍按原速进行。
+    if page == 1 and token is None:
+        state.note_home_arrival(home_delay)
+        if home_delay > 0:
+            time.sleep(home_delay)
     return state.serve_catalog(token, page)
 
 

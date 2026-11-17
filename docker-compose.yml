@@ -1,0 +1,41 @@
+services:
+  # 本地示例藏品目录源（三版数据 / 快照令牌分页 / 故障注入控制台）
+  source:
+    build:
+      context: .
+      dockerfile: Dockerfile.source
+    container_name: museum-source
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 采集端：FastAPI + SQLite 网页
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: museum-app
+    environment:
+      # 容器内通过服务名访问示例源；网页表单预填同一地址
+      MUSEUM_DEFAULT_SOURCE_URL: "http://source:8001/catalog"
+      MUSEUM_SOURCE_ADMIN_URL: "http://localhost:8001/"
+      MUSEUM_DB_PATH: "/data/museum.db"
+    ports:
+      - "8000:8000"
+    volumes:
+      - museum-data:/data
+    depends_on:
+      source:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  museum-data:

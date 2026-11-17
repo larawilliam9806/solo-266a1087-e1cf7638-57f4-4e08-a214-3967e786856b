@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>博物馆藏品开放目录采集台</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #0b1220; color: #e2e8f0; }
+  main { max-width: 1080px; margin: 0 auto; padding: 28px 20px 70px; }
+  h1 { font-size: 23px; margin: 0 0 4px; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+  .sub a { color: #7dd3fc; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px; }
+  .card h2 { font-size: 15px; margin: 0 0 14px; color: #7dd3fc; }
+  label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+  input[type=text] { width: 100%; font: inherit; padding: 9px 11px; border-radius: 8px;
+    border: 1px solid #475569; background: #0f172a; color: #f1f5f9; }
+  button { font: inherit; border-radius: 8px; border: 1px solid #475569; padding: 9px 16px;
+    background: #2563eb; color: #fff; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  button.ghost { background: #334155; }
+  button.ghost:hover { background: #475569; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #334155; vertical-align: top; }
+  th { color: #94a3b8; font-weight: 500; }
+  code { background: #0f172a; padding: 2px 6px; border-radius: 6px; font-size: 11.5px; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; white-space: nowrap; }
+  .s-running { background: #1e3a8a; color: #bfdbfe; }
+  .s-failed { background: #78350f; color: #fde68a; }
+  .s-invalid { background: #7f1d1d; color: #fecaca; }
+  .s-published { background: #14532d; color: #bbf7d0; }
+  .s-superseded { background: #4c1d95; color: #ddd6fe; }
+  .s-completed { background: #155e75; color: #cffafe; }
+  .err-text { color: #fca5a5; font-size: 11.5px; margin-top: 4px; }
+  #msg { min-height: 18px; font-size: 13px; margin-top: 10px; }
+  .ok { color: #4ade80; } .err { color: #f87171; }
+  .muted { color: #94a3b8; font-size: 12px; }
+  .full { grid-column: 1 / -1; }
+  .tag { font-size: 11px; background: #0f172a; border: 1px solid #334155; padding: 1px 7px; border-radius: 6px; }
+  .dl { background: #15803d; } .dl:hover { background: #166534; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🏛 博物馆藏品开放目录采集台</h1>
+  <div class="sub">
+    面向研究人员的完整数据集发布服务 ·
+    <a id="adminLink" href="#" target="_blank" rel="noopener">示例源故障控制台 ↗</a> ·
+    <a href="/docs">API 文档</a>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>① 新建采集批次</h2>
+      <label for="sourceUrl">目录接口地址（批次将绑定该地址下发的快照令牌）</label>
+      <input id="sourceUrl" type="text" placeholder="http://source:8001/catalog" />
+      <div class="row">
+        <button onclick="createBatch()">启动新批次</button>
+        <button class="ghost" onclick="refresh()">刷新状态</button>
+      </div>
+      <div id="msg"></div>
+      <p class="muted" style="margin-top:14px">
+        令牌失效（410）的批次无法续采，需新建批次；新旧快照不会混用。
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>② 当前已发布数据集</h2>
+      <div id="publishedMeta" class="muted">加载中…</div>
+      <div class="row">
+        <button class="dl" onclick="download()">⬇ 下载完整 JSON</button>
+        <button class="ghost" onclick="refresh()">刷新</button>
+      </div>
+      <p class="muted" style="margin-top:12px">
+        仅当某批次整批采齐才会发布；发布时全量替换，源中已删除的藏品一并移除；
+        采集失败不会影响当前已发布数据。
+      </p>
+    </section>
+
+    <section class="card full">
+      <h2>③ 批次（支持多批并行；每 2 秒自动刷新）</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>状态</th><th>源版本</th><th>快照令牌</th>
+            <th>页进度</th><th>已保存页</th><th>启动 / 完成</th><th>操作 / 错误</th>
+          </tr>
+        </thead>
+        <tbody id="batchRows"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card full">
+      <h2>④ 已发布藏品预览</h2>
+      <table>
+        <thead><tr><th>编号</th><th>名称</th><th>年代</th><th>材质</th></tr></thead>
+        <tbody id="itemRows"><tr><td colspan="4" class="muted">尚无已发布数据</td></tr></tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const STATUS_LABEL = {
+  running: "采集中", failed: "失败（可续采）", invalid: "令牌失效（须新建批次）",
+  published: "已发布", superseded: "被更新批次取代", completed: "已完成"
+};
+function flash(text, ok) {
+  const el = $("msg");
+  el.textContent = text; el.className = ok ? "ok" : "err";
+  if (ok) setTimeout(() => { el.textContent = ""; }, 4000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail || data);
+    throw new Error(detail || ("HTTP " + r.status));
+  }
+  return data;
+}
+async function createBatch() {
+  const url = $("sourceUrl").value.trim();
+  if (!url) return flash("请填写目录接口地址", false);
+  try {
+    const b = await api("/api/batches", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({source_url: url})
+    });
+    flash(`批次 #${b.id} 已创建并开始采集（快照 ${b.snapshot_token}）`, true);
+    await refresh();
+  } catch (e) { flash("创建失败：" + e.message, false); }
+}
+async function resume(id) {
+  try {
+    await api(`/api/batches/${id}/resume`, {method: "POST"});
+    flash(`批次 #${id} 已续采，已保存页将直接复用`, true);
+    await refresh();
+  } catch (e) { flash("续采失败：" + e.message, false); }
+}
+function download() { window.location.href = "/api/published/download"; }
+
+function renderBatches(data) {
+  const rows = data.batches.map(b => {
+    const saved = (b.saved_pages || []).join(", ") || "—";
+    const total = b.total_pages ?? "?";
+    const canResume = (b.status === "failed") && !b.active;
+    const action = canResume
+      ? `<button class="ghost" onclick="resume(${b.id})">续采</button>`
+      : (b.active ? `<span class="tag">线程运行中</span>` : "—");
+    const err = b.error_message ? `<div class="err-text">${b.error_message}</div>` : "";
+    return `<tr>
+      <td>#${b.id}</td>
+      <td><span class="badge s-${b.status}">${STATUS_LABEL[b.status] || b.status}</span></td>
+      <td>${b.source_version ?? "—"}</td>
+      <td><code>${b.snapshot_token}</code></td>
+      <td>${(b.saved_pages || []).length} / ${total}</td>
+      <td>${saved}</td>
+      <td class="muted">${(b.started_at || "").replace("T", " ").replace("+00:00", "Z")}<br>
+        ${(b.finished_at || "—").replace("T", " ").replace("+00:00", "Z")}</td>
+      <td>${action}${err}</td>
+    </tr>`;
+  }).join("");
+  $("batchRows").innerHTML = rows || `<tr><td colspan="8" class="muted">尚无批次</td></tr>`;
+}
+
+async function refresh() {
+  try {
+    const [bData, pResp] = await Promise.all([
+      api("/api/batches"),
+      fetch("/api/published")
+    ]);
+    renderBatches(bData);
+    if (pResp.ok) {
+      const p = await pResp.json();
+      const s = p.snapshot;
+      $("publishedMeta").innerHTML =
+        `发布于 <b>${s.published_at.replace("T", " ").replace("+00:00", "Z")}</b> ·
+         批次 #${s.batch_id} · 版本 <code>${s.source_version ?? "—"}</code> ·
+         快照 <code>${s.snapshot_token}</code> · 藏品 <b>${s.item_count}</b> 条`;
+      $("itemRows").innerHTML = p.items.map(it =>
+        `<tr><td>${it.id}</td><td>${it.name}</td><td>${it.era ?? ""}</td><td>${it.material ?? ""}</td></tr>`
+      ).join("");
+    } else {
+      $("publishedMeta").textContent = "尚无已发布数据集（等待首个批次整批采齐）";
+      $("itemRows").innerHTML = `<tr><td colspan="4" class="muted">尚无已发布数据</td></tr>`;
+    }
+  } catch (e) {
+    $("batchRows").innerHTML = `<tr><td colspan="8" class="err-text">刷新失败：${e.message}</td></tr>`;
+  }
+}
+
+fetch("/api/config").then(r => r.json()).then(c => {
+  $("sourceUrl").value = c.default_source_url;
+  $("adminLink").href = c.source_admin_url;
+}).catch(() => {});
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
